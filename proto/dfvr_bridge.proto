@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package dfvr;
+
+// Vector3 representation for Godot
+message Vector3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+// Represents a single anatomical body part (e.g., "Left Upper Arm")
+message BodyPart {
+  int32 id = 1;
+  string name = 2;
+  Vector3 relative_position = 3; // Position relative to entity root
+  float size_volume = 4;         // Used for Godot collider scaling
+  bool is_severed = 5;
+}
+
+// Represents an entity (Player or NPC)
+message EntityData {
+  int32 entity_id = 1;
+  string name = 2;
+  Vector3 position = 3;          // World space position
+  repeated BodyPart body_parts = 4;
+}
+
+// Current available Adventure Mode actions/conversation options
+message MenuOption {
+  int32 option_id = 1;
+  string text_content = 2;       // To be interpreted by the LLM
+}
+
+// Full state payload sent from DFHack to Godot
+message GameStatePayload {
+  uint64 frame_tick = 1;
+  repeated EntityData entities = 2;
+  repeated MenuOption current_menu_options = 3;
+  string latest_log_text = 4;    // DF generated text to be rewritten by LLM
+}
+
+// Request sent from Godot to DFHack
+message ActionRequest {
+  int32 selected_option_id = 1;
+  string llm_generated_intent = 2; // Optional, if we map raw text to intents
+}
