@@ -86,26 +86,37 @@ public partial class DFVRClient : Node
 
     private void NetworkLoop()
     {
-        // Simple loop to read from the stream
-        // In a robust implementation, use proper message framing (e.g., length-prefixed)
         while (_isRunning)
         {
             try
             {
-                if (_stream.DataAvailable)
+                // 1. Read 4-byte length prefix
+                byte[] lengthBytes = new byte[4];
+                int read = _stream.Read(lengthBytes, 0, 4);
+                if (read == 0) break; // Connection closed
+                if (read < 4) continue; // Partial read, should handle better in production
+
+                int payloadLength = BitConverter.ToInt32(lengthBytes, 0);
+                if (payloadLength <= 0) continue;
+
+                // 2. Read full payload
+                byte[] payloadBytes = new byte[payloadLength];
+                int totalRead = 0;
+                while (totalRead < payloadLength)
                 {
-                    // Read data and parse Protobuf
-                    // Note: Google.Protobuf can parse length-prefixed streams: GameStatePayload.Parser.ParseDelimitedFrom(_stream)
-                    // For this example, we'll assume ParseFrom works on the raw stream if it's the only thing sent
-                    
-                    var payload = GameStatePayload.Parser.ParseDelimitedFrom(_stream);
-                    
-                    if (payload != null)
+                    int r = _stream.Read(payloadBytes, totalRead, payloadLength - totalRead);
+                    if (r == 0) break;
+                    totalRead += r;
+                }
+
+                // 3. Deserialize GameStatePayload
+                var payload = GameStatePayload.Parser.ParseFrom(payloadBytes);
+                
+                if (payload != null)
+                {
+                    lock (_payloadLock)
                     {
-                        lock (_payloadLock)
-                        {
-                            _latestPayload = payload;
-                        }
+                        _latestPayload = payload;
                     }
                 }
             }
@@ -115,7 +126,7 @@ public partial class DFVRClient : Node
                 _isRunning = false;
             }
 
-            Thread.Sleep(50); // 20 TPS
+            // No Sleep here, let Read block
         }
     }
 
@@ -140,19 +151,102 @@ public partial class DFVRClient : Node
 
     private void ProcessPayload(GameStatePayload payload)
     {
-        // Example: Iterate entities and update their Godot nodes
         foreach (var entity in payload.Entities)
         {
-            // Find or instantiate entity node
-            // e.g., UpdateEntity(entity);
-            
-            // GD.Print($"Processing Entity: {entity.Name}");
+            UpdateEntityInGodot(entity);
         }
         
-        // Output logs to LLM service or UI
-        if (!string.IsNullOrEmpty(payload.LatestLogText))
+        foreach (var block in payload.MapBlocks)
         {
-            // GD.Print($"DF Log: {payload.LatestLogText}");
+            UpdateMapBlockInGodot(block);
+        }
+    }
+
+    private void UpdateEntityInGodot(EntityData entity)
+    {
+        string nodeName = $"Unit_{entity.EntityId}";
+        Node3D unitNode = GetNodeOrNull<Node3D>(nodeName);
+
+        if (unitNode == null)
+        {
+            unitNode = new Node3D(); // Container for body parts
+            unitNode.Name = nodeName;
+            AddChild(unitNode);
+            GD.Print($"Spawned unit: {entity.Name}");
+        }
+
+        // Update Global Position
+        unitNode.Position = new Vector3(entity.Position.X, entity.Position.Y, entity.Position.Z);
+
+        // Update Anatomical Hitboxes
+        foreach (var part in entity.BodyParts)
+        {
+            UpdateBodyPartHitbox(unitNode, part);
+        }
+    }
+
+    private void UpdateBodyPartHitbox(Node3D parent, BodyPart part)
+    {
+        string partName = $"Part_{part.Id}";
+        MeshInstance3D partNode = parent.GetNodeOrNull<MeshInstance3D>(partName);
+        
+        if (partNode == null)
+        {
+            partNode = new MeshInstance3D();
+            partNode.Name = partName;
+            
+            // Use a sphere as a generic hitbox proxy
+            var sphere = new SphereMesh();
+            partNode.Mesh = sphere;
+            parent.AddChild(partNode);
+        }
+        
+        // Simple volumetric scaling (cube root of relsize)
+        float scale = (float)Math.Pow(part.SizeVolume / 5000.0, 1.0/3.0);
+        partNode.Scale = new Vector3(scale, scale, scale);
+        
+        // Relative position within the unit
+        partNode.Position = new Vector3(part.RelativePosition.X, part.RelativePosition.Y, part.RelativePosition.Z);
+    }
+
+    private void UpdateMapBlockInGodot(MapBlock block)
+    {
+        // Use MultiMesh for efficient rendering of 16x16 blocks
+        string blockName = $"Block_{block.Position.X}_{block.Position.Z}";
+        MultiMeshInstance3D blockNode = GetNodeOrNull<MultiMeshInstance3D>(blockName);
+        
+        if (blockNode == null)
+        {
+            blockNode = new MultiMeshInstance3D();
+            blockNode.Name = blockName;
+            
+            var multiMesh = new MultiMesh();
+            multiMesh.TransformFormat = MultiMesh.TransformFormatEnum.Transform3D;
+            multiMesh.Mesh = new BoxMesh(); // Generic 1x1x1 cube
+            multiMesh.InstanceCount = 256; 
+            
+            blockNode.Multimesh = multiMesh;
+            AddChild(blockNode);
+        }
+        
+        blockNode.Position = new Vector3(block.Position.X, block.Position.Y, block.Position.Z);
+        
+        for (int i = 0; i < block.Tiles.Count; i++)
+        {
+            int x = i % 16;
+            int z = i / 16;
+            int tileType = block.Tiles[i];
+            
+            // Basic logic: if tileType is non-zero, it's solid
+            Transform3D transform = new Transform3D(Basis.Identity, new Vector3(x, 0, z));
+            
+            if (tileType <= 0) 
+            {
+                // Hide empty tiles by scaling to zero
+                transform.Basis = Basis.Identity.Scaled(Vector3.Zero);
+            }
+            
+            blockNode.Multimesh.SetInstanceTransform(i, transform);
         }
     }
 
