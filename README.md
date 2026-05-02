@@ -56,7 +56,7 @@ By replacing clunky spreadsheet menus with deterministic spatial physics and a l
 ### Milestone 1: The Backend Bridge
 - [x] Initialize DFHack C++ TCP Server.
 - [x] Define `.proto` schemas for Player XYZ, Map Blocks, and Entity Hitboxes.
-- [ ] Establish two-way handshake with Godot 4.
+- [x] Establish two-way handshake with Godot 4.
 
 ### Milestone 2: Spatial Physics
 - [ ] Implement greedy meshing for DF map blocks in Godot.
