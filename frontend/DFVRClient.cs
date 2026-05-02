@@ -19,25 +19,68 @@ public partial class DFVRClient : Node
 
     public override void _Ready()
     {
-        ConnectToServer("127.0.0.1", 9000);
+        _ = ConnectAndHandshakeAsync("127.0.0.1", 9000);
     }
 
-    private void ConnectToServer(string ip, int port)
+    private async Task ConnectAndHandshakeAsync(string ip, int port)
     {
         try
         {
-            _client = new TcpClient(ip, port);
+            _client = new TcpClient();
+            await _client.ConnectAsync(ip, port);
             _stream = _client.GetStream();
-            _isRunning = true;
+            
+            GD.Print("Connected to server, initiating handshake...");
 
+            // 1. Prepare HandshakeRequest
+            var request = new HandshakeRequest
+            {
+                ClientVersion = "Godot VR Client 0.1a",
+                Status = "Ready"
+            };
+
+            // 2. Send length-prefixed HandshakeRequest
+            byte[] requestBytes = request.ToByteArray();
+            byte[] lengthPrefix = BitConverter.GetBytes(requestBytes.Length);
+            
+            // BitConverter uses system endianness. We assume Little Endian on Windows to match C++.
+            await _stream.WriteAsync(lengthPrefix, 0, lengthPrefix.Length);
+            await _stream.WriteAsync(requestBytes, 0, requestBytes.Length);
+            
+            GD.Print("HandshakeRequest sent. Awaiting response...");
+
+            // 3. Receive length-prefixed HandshakeResponse
+            byte[] responseLengthBytes = new byte[4];
+            int bytesRead = await _stream.ReadAsync(responseLengthBytes, 0, 4);
+            if (bytesRead < 4)
+            {
+                GD.PrintErr("Failed to read handshake response length.");
+                return;
+            }
+
+            int responseLength = BitConverter.ToInt32(responseLengthBytes, 0);
+            byte[] responseBytes = new byte[responseLength];
+            
+            int totalRead = 0;
+            while (totalRead < responseLength)
+            {
+                int read = await _stream.ReadAsync(responseBytes, totalRead, responseLength - totalRead);
+                if (read == 0) throw new Exception("Connection closed while reading response.");
+                totalRead += read;
+            }
+
+            // 4. Deserialize HandshakeResponse
+            var response = HandshakeResponse.Parser.ParseFrom(responseBytes);
+            GD.Print($"Handshake Successful! Server Version: {response.ServerVersion}, Time: {response.WorldTime}");
+
+            // 5. Start main network loop for GameStatePayloads
+            _isRunning = true;
             _networkThread = new Thread(NetworkLoop);
             _networkThread.Start();
-            
-            GD.Print("Connected to DFVR Bridge.");
         }
         catch (Exception e)
         {
-            GD.PrintErr($"Failed to connect: {e.Message}");
+            GD.PrintErr($"Handshake failed: {e.Message}");
         }
     }
 

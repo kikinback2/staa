@@ -45,3 +45,17 @@ message ActionRequest {
   int32 selected_option_id = 1;
   string llm_generated_intent = 2; // Optional, if we map raw text to intents
 }
+
+// Handshake Request sent from Godot to DFHack
+message HandshakeRequest {
+  string client_version = 1;
+  string status = 2;
+}
+
+// Handshake Response sent from DFHack to Godot
+message HandshakeResponse {
+  string server_version = 1;
+  string connection_status = 2;
+  uint64 world_time = 3;
+  int32 player_id = 4;
+}
