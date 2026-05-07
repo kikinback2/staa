@@ -3,23 +3,42 @@ using System;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 using Google.Protobuf;
-using Dfvr; // Assuming this is the generated namespace
+using Dfvr;
 
 public partial class DFVRClient : Node
 {
     private TcpClient _client;
     private NetworkStream _stream;
-    private Thread _networkThread;
     private bool _isRunning = false;
 
-    // A thread-safe queue or single payload buffer
+    [Export] public string ServerIp = "127.0.0.1";
+    [Export] public int ServerPort = 9000;
+
     private GameStatePayload _latestPayload;
     private readonly object _payloadLock = new object();
 
+    private Queue<ActionRequest> _pendingActions = new Queue<ActionRequest>();
+    private readonly object _actionLock = new object();
+
     public override void _Ready()
     {
-        _ = ConnectAndHandshakeAsync("127.0.0.1", 9000);
+        _ = ConnectAndHandshakeAsync(ServerIp, ServerPort);
+    }
+
+    public void SendAction(int optionId)
+    {
+        lock (_actionLock)
+        {
+            _pendingActions.Enqueue(new ActionRequest { SelectedOptionId = optionId });
+        }
+    }
+
+    public void SimulateWeaponHit(int hitBodyPartId)
+    {
+        GD.Print($"Simulating weapon hit on body part ID: {hitBodyPartId}");
+        SendAction(hitBodyPartId);
     }
 
     private async Task ConnectAndHandshakeAsync(string ip, int port)
@@ -32,31 +51,21 @@ public partial class DFVRClient : Node
             
             GD.Print("Connected to server, initiating handshake...");
 
-            // 1. Prepare HandshakeRequest
             var request = new HandshakeRequest
             {
                 ClientVersion = "Godot VR Client 0.1a",
                 Status = "Ready"
             };
 
-            // 2. Send length-prefixed HandshakeRequest
             byte[] requestBytes = request.ToByteArray();
             byte[] lengthPrefix = BitConverter.GetBytes(requestBytes.Length);
             
-            // BitConverter uses system endianness. We assume Little Endian on Windows to match C++.
             await _stream.WriteAsync(lengthPrefix, 0, lengthPrefix.Length);
             await _stream.WriteAsync(requestBytes, 0, requestBytes.Length);
             
-            GD.Print("HandshakeRequest sent. Awaiting response...");
-
-            // 3. Receive length-prefixed HandshakeResponse
             byte[] responseLengthBytes = new byte[4];
             int bytesRead = await _stream.ReadAsync(responseLengthBytes, 0, 4);
-            if (bytesRead < 4)
-            {
-                GD.PrintErr("Failed to read handshake response length.");
-                return;
-            }
+            if (bytesRead < 4) return;
 
             int responseLength = BitConverter.ToInt32(responseLengthBytes, 0);
             byte[] responseBytes = new byte[responseLength];
@@ -69,14 +78,11 @@ public partial class DFVRClient : Node
                 totalRead += read;
             }
 
-            // 4. Deserialize HandshakeResponse
             var response = HandshakeResponse.Parser.ParseFrom(responseBytes);
             GD.Print($"Handshake Successful! Server Version: {response.ServerVersion}, Time: {response.WorldTime}");
 
-            // 5. Start main network loop for GameStatePayloads
             _isRunning = true;
-            _networkThread = new Thread(NetworkLoop);
-            _networkThread.Start();
+            _ = Task.Run(NetworkLoopAsync);
         }
         catch (Exception e)
         {
@@ -84,40 +90,61 @@ public partial class DFVRClient : Node
         }
     }
 
-    private void NetworkLoop()
+    private async Task NetworkLoopAsync()
     {
+        byte[] lengthBytes = new byte[4];
+
         while (_isRunning)
         {
             try
             {
-                // 1. Read 4-byte length prefix
-                byte[] lengthBytes = new byte[4];
-                int read = _stream.Read(lengthBytes, 0, 4);
-                if (read == 0) break; // Connection closed
-                if (read < 4) continue; // Partial read, should handle better in production
-
-                int payloadLength = BitConverter.ToInt32(lengthBytes, 0);
-                if (payloadLength <= 0) continue;
-
-                // 2. Read full payload
-                byte[] payloadBytes = new byte[payloadLength];
-                int totalRead = 0;
-                while (totalRead < payloadLength)
+                lock (_actionLock)
                 {
-                    int r = _stream.Read(payloadBytes, totalRead, payloadLength - totalRead);
-                    if (r == 0) break;
-                    totalRead += r;
+                    while (_pendingActions.Count > 0)
+                    {
+                        var action = _pendingActions.Dequeue();
+                        byte[] actionBytes = action.ToByteArray();
+                        byte[] lengthPrefix = BitConverter.GetBytes(actionBytes.Length);
+                        
+                        _stream.Write(lengthPrefix, 0, lengthPrefix.Length);
+                        _stream.Write(actionBytes, 0, actionBytes.Length);
+                    }
                 }
 
-                // 3. Deserialize GameStatePayload
-                var payload = GameStatePayload.Parser.ParseFrom(payloadBytes);
-                
-                if (payload != null)
+                if (_stream.DataAvailable)
                 {
-                    lock (_payloadLock)
+                    int lengthRead = 0;
+                    while (lengthRead < 4)
                     {
-                        _latestPayload = payload;
+                        int read = await _stream.ReadAsync(lengthBytes, lengthRead, 4 - lengthRead);
+                        if (read == 0) throw new Exception("Connection closed while reading length prefix.");
+                        lengthRead += read;
                     }
+
+                    int payloadLength = BitConverter.ToInt32(lengthBytes, 0);
+                    if (payloadLength <= 0 || payloadLength > 10 * 1024 * 1024) throw new Exception($"Invalid payload length: {payloadLength}");
+
+                    byte[] payloadBytes = new byte[payloadLength];
+                    int totalRead = 0;
+                    while (totalRead < payloadLength)
+                    {
+                        int r = await _stream.ReadAsync(payloadBytes, totalRead, payloadLength - totalRead);
+                        if (r == 0) throw new Exception("Connection closed while reading payload.");
+                        totalRead += r;
+                    }
+
+                    var payload = GameStatePayload.Parser.ParseFrom(payloadBytes);
+                    if (payload != null)
+                    {
+                        lock (_payloadLock)
+                        {
+                            _latestPayload = payload;
+                        }
+                    }
+                }
+                else
+                {
+                    await Task.Delay(10);
                 }
             }
             catch (Exception e)
@@ -125,8 +152,6 @@ public partial class DFVRClient : Node
                 GD.PrintErr($"Network Error: {e.Message}");
                 _isRunning = false;
             }
-
-            // No Sleep here, let Read block
         }
     }
 
@@ -139,7 +164,7 @@ public partial class DFVRClient : Node
             if (_latestPayload != null)
             {
                 payloadToProcess = _latestPayload;
-                _latestPayload = null; // Clear so we don't process it twice
+                _latestPayload = null;
             }
         }
 
@@ -169,16 +194,14 @@ public partial class DFVRClient : Node
 
         if (unitNode == null)
         {
-            unitNode = new Node3D(); // Container for body parts
+            unitNode = new Node3D();
             unitNode.Name = nodeName;
             AddChild(unitNode);
             GD.Print($"Spawned unit: {entity.Name}");
         }
 
-        // Update Global Position
         unitNode.Position = new Vector3(entity.Position.X, entity.Position.Y, entity.Position.Z);
 
-        // Update Anatomical Hitboxes
         foreach (var part in entity.BodyParts)
         {
             UpdateBodyPartHitbox(unitNode, part);
@@ -188,66 +211,149 @@ public partial class DFVRClient : Node
     private void UpdateBodyPartHitbox(Node3D parent, BodyPart part)
     {
         string partName = $"Part_{part.Id}";
-        MeshInstance3D partNode = parent.GetNodeOrNull<MeshInstance3D>(partName);
+        Area3D partNode = parent.GetNodeOrNull<Area3D>(partName);
         
         if (partNode == null)
         {
-            partNode = new MeshInstance3D();
+            partNode = new Area3D();
             partNode.Name = partName;
+            partNode.CollisionLayer = 2; // Enemy layer
+            partNode.CollisionMask = 0;
             
-            // Use a sphere as a generic hitbox proxy
-            var sphere = new SphereMesh();
-            partNode.Mesh = sphere;
+            var collisionShape = new CollisionShape3D();
+            var shape = new CapsuleShape3D();
+            collisionShape.Shape = shape;
+            
+            partNode.AddChild(collisionShape);
             parent.AddChild(partNode);
+            
+            partNode.SetMeta("body_part_id", part.Id);
+            partNode.SetMeta("entity_id", parent.Name.Replace("Unit_", ""));
         }
         
-        // Simple volumetric scaling (cube root of relsize)
         float scale = (float)Math.Pow(part.SizeVolume / 5000.0, 1.0/3.0);
-        partNode.Scale = new Vector3(scale, scale, scale);
+        var capShape = (CapsuleShape3D)((CollisionShape3D)partNode.GetChild(0)).Shape;
+        capShape.Radius = scale * 0.25f;
+        capShape.Height = scale * 1.0f;
         
-        // Relative position within the unit
         partNode.Position = new Vector3(part.RelativePosition.X, part.RelativePosition.Y, part.RelativePosition.Z);
     }
 
     private void UpdateMapBlockInGodot(MapBlock block)
     {
-        // Use MultiMesh for efficient rendering of 16x16 blocks
         string blockName = $"Block_{block.Position.X}_{block.Position.Z}";
-        MultiMeshInstance3D blockNode = GetNodeOrNull<MultiMeshInstance3D>(blockName);
+        StaticBody3D blockNode = GetNodeOrNull<StaticBody3D>(blockName);
         
         if (blockNode == null)
         {
-            blockNode = new MultiMeshInstance3D();
+            blockNode = new StaticBody3D();
             blockNode.Name = blockName;
-            
-            var multiMesh = new MultiMesh();
-            multiMesh.TransformFormat = MultiMesh.TransformFormatEnum.Transform3D;
-            multiMesh.Mesh = new BoxMesh(); // Generic 1x1x1 cube
-            multiMesh.InstanceCount = 256; 
-            
-            blockNode.Multimesh = multiMesh;
             AddChild(blockNode);
         }
-        
+        else
+        {
+            foreach (Node child in blockNode.GetChildren())
+            {
+                child.QueueFree();
+            }
+        }
+
         blockNode.Position = new Vector3(block.Position.X, block.Position.Y, block.Position.Z);
         
-        for (int i = 0; i < block.Tiles.Count; i++)
+        var surfaceTool = new SurfaceTool();
+        surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
+        
+        bool[,] visited = new bool[16, 16];
+        
+        for (int z = 0; z < 16; z++)
         {
-            int x = i % 16;
-            int z = i / 16;
-            int tileType = block.Tiles[i];
-            
-            // Basic logic: if tileType is non-zero, it's solid
-            Transform3D transform = new Transform3D(Basis.Identity, new Vector3(x, 0, z));
-            
-            if (tileType <= 0) 
+            for (int x = 0; x < 16; x++)
             {
-                // Hide empty tiles by scaling to zero
-                transform.Basis = Basis.Identity.Scaled(Vector3.Zero);
+                if (visited[x, z]) continue;
+                
+                int tileType = block.Tiles[z * 16 + x];
+                if (tileType <= 0) continue;
+                
+                int endX = x;
+                while (endX + 1 < 16 && !visited[endX + 1, z] && block.Tiles[z * 16 + (endX + 1)] == tileType)
+                {
+                    endX++;
+                }
+                
+                int endZ = z;
+                bool canExpandZ = true;
+                while (canExpandZ && endZ + 1 < 16)
+                {
+                    for (int ix = x; ix <= endX; ix++)
+                    {
+                        if (visited[ix, endZ + 1] || block.Tiles[(endZ + 1) * 16 + ix] != tileType)
+                        {
+                            canExpandZ = false;
+                            break;
+                        }
+                    }
+                    if (canExpandZ) endZ++;
+                }
+                
+                for (int iz = z; iz <= endZ; iz++)
+                {
+                    for (int ix = x; ix <= endX; ix++)
+                    {
+                        visited[ix, iz] = true;
+                    }
+                }
+                
+                AddCubeToSurfaceTool(surfaceTool, new Vector3(x, 0, z), new Vector3(endX + 1, 1, endZ + 1));
             }
-            
-            blockNode.Multimesh.SetInstanceTransform(i, transform);
         }
+        
+        surfaceTool.Index();
+        var arrayMesh = surfaceTool.Commit();
+        
+        if (arrayMesh != null)
+        {
+            var meshInstance = new MeshInstance3D();
+            meshInstance.Mesh = arrayMesh;
+            blockNode.AddChild(meshInstance);
+            
+            var collisionShape = new CollisionShape3D();
+            var concaveShape = arrayMesh.CreateTrimeshShape();
+            collisionShape.Shape = concaveShape;
+            blockNode.AddChild(collisionShape);
+        }
+    }
+    
+    private void AddCubeToSurfaceTool(SurfaceTool st, Vector3 min, Vector3 max)
+    {
+        // Top
+        st.SetNormal(new Vector3(0, 1, 0));
+        st.AddVertex(new Vector3(min.X, max.Y, min.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z));
+        st.AddVertex(new Vector3(min.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z));
+        
+        // Bottom
+        st.SetNormal(new Vector3(0, -1, 0));
+        st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z)); st.AddVertex(new Vector3(min.X, min.Y, max.Z));
+        st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z));
+        
+        // Front
+        st.SetNormal(new Vector3(0, 0, 1));
+        st.AddVertex(new Vector3(min.X, min.Y, max.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z));
+        st.AddVertex(new Vector3(min.X, min.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z));
+        
+        // Back
+        st.SetNormal(new Vector3(0, 0, -1));
+        st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(min.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z));
+        st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, min.Z));
+        
+        // Left
+        st.SetNormal(new Vector3(-1, 0, 0));
+        st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(min.X, min.Y, max.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z));
+        st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z)); st.AddVertex(new Vector3(min.X, max.Y, min.Z));
+        
+        // Right
+        st.SetNormal(new Vector3(1, 0, 0));
+        st.AddVertex(new Vector3(max.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z));
+        st.AddVertex(new Vector3(max.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z));
     }
 
     public override void _ExitTree()
@@ -255,9 +361,5 @@ public partial class DFVRClient : Node
         _isRunning = false;
         _stream?.Close();
         _client?.Close();
-        if (_networkThread != null && _networkThread.IsAlive)
-        {
-            _networkThread.Join();
-        }
     }
 }
