@@ -5,11 +5,16 @@
 #include "df/unit_body_part_status.h"
 #include "df/viewscreen_adventure_menust.h"
 #include "dfvr_bridge.pb.h"
+#include "Core.h"
 
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <string>
+#include <chrono>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -33,8 +38,14 @@ DFHACK_PLUGIN("dfvr_bridge");
 
 static std::thread server_thread;
 static std::mutex state_mutex;
+static std::condition_variable state_cv;
+static bool state_updated = false;
 static bool is_running = false;
 static SOCKET server_socket = INVALID_SOCKET;
+
+// Thread-safe action queue
+static std::vector<dfvr::ActionRequest> pending_actions;
+static std::mutex actions_mutex;
 
 // Shared state buffer populated by the main thread
 static dfvr::GameStatePayload shared_game_state;
@@ -124,15 +135,36 @@ void ScrapeMapBlocks(dfvr::GameStatePayload& payload) {
 
 // DFHack Update Hook (Main Thread)
 DFhackCExport command_result plugin_onupdate(color_ostream &out) {
-    std::lock_guard<std::mutex> lock(state_mutex);
-    
-    // Clear and re-populate the shared state
-    shared_game_state.Clear();
-    shared_game_state.set_frame_tick(world->frame_counter);
-    
-    ScrapeMenuOptions(shared_game_state);
-    ScrapeEntities(shared_game_state);
-    ScrapeMapBlocks(shared_game_state);
+    // Process Actions
+    {
+        std::lock_guard<std::mutex> lock(actions_mutex);
+        for (const auto& action : pending_actions) {
+            auto screen = Gui::getCurViewscreen(true);
+            if (auto adv_menu = virtual_cast<df::viewscreen_adventure_menust>(screen)) {
+                out.print("DFVR: Received ActionRequest to inject option %d\n", action.selected_option_id());
+                // Example: In a fully mapped system, we would find the matching option and simulate a keystroke
+                // adv_menu->feed_key(interface_key::SELECT); 
+            } else {
+                out.print("DFVR: Received ActionRequest %d, but not in adventure menu.\n", action.selected_option_id());
+            }
+        }
+        pending_actions.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        
+        // Clear and re-populate the shared state
+        shared_game_state.Clear();
+        shared_game_state.set_frame_tick(world->frame_counter);
+        
+        ScrapeMenuOptions(shared_game_state);
+        ScrapeEntities(shared_game_state);
+        ScrapeMapBlocks(shared_game_state);
+        
+        state_updated = true;
+    }
+    state_cv.notify_all();
     
     return CR_OK;
 }
@@ -159,9 +191,27 @@ bool WriteExact(SOCKET sock, const char* buffer, size_t length) {
 }
 
 void HandleClient(SOCKET client_socket) {
+    // Set timeouts to prevent hanging on ReadExact/WriteExact if client crashes
+#ifdef _WIN32
+    DWORD timeout = 1000; // 1 second
+#else
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+#endif
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+
     // 1. Read 4-byte length prefix
     uint32_t length_prefix = 0;
     if (!ReadExact(client_socket, reinterpret_cast<char*>(&length_prefix), sizeof(length_prefix))) {
+        closesocket(client_socket);
+        return;
+    }
+    
+    // Prevent massive allocation from malformed packets (10MB limit)
+    if (length_prefix == 0 || length_prefix > 10 * 1024 * 1024) {
+        std::cerr << "Invalid HandshakeRequest length: " << length_prefix << std::endl;
         closesocket(client_socket);
         return;
     }
@@ -179,10 +229,19 @@ void HandleClient(SOCKET client_socket) {
         
         // 3. Send HandshakeResponse
         dfvr::HandshakeResponse response;
-        response.set_server_version("DFVR Bridge 0.1a");
+        std::string df_version = "Unknown";
+        if (Core::getInstance().vinfo) {
+            df_version = Core::getInstance().vinfo->getVersion();
+        }
+        response.set_server_version("DFHack " + df_version + " - DFVR Bridge 0.1a");
         response.set_connection_status("OK");
-        response.set_world_time(123456789);
-        response.set_player_id(1);
+        response.set_world_time(world->frame_counter);
+        
+        int player_id = -1;
+        if (!world->units.active.empty()) {
+            player_id = world->units.active[0]->id;
+        }
+        response.set_player_id(player_id);
         
         std::string serialized_response;
         response.SerializeToString(&serialized_response);
@@ -198,22 +257,75 @@ void HandleClient(SOCKET client_socket) {
         // 4. ENTER STREAMING MODE
         std::cout << "Client handshaked. Entering streaming mode..." << std::endl;
         while (is_running) {
-            std::string payload_data;
-            {
-                std::lock_guard<std::mutex> lock(state_mutex);
-                shared_game_state.SerializeToString(&payload_data);
+            // Check for incoming ActionRequests
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(client_socket, &readfds);
+
+            timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 10000; // 10ms
+
+            int result = select(client_socket + 1, &readfds, NULL, NULL, &tv);
+            if (result > 0 && FD_ISSET(client_socket, &readfds)) {
+                uint32_t req_length = 0;
+                if (ReadExact(client_socket, reinterpret_cast<char*>(&req_length), sizeof(req_length))) {
+                    if (req_length > 0 && req_length <= 1024 * 1024) { // 1MB sanity check
+                        std::vector<char> req_buf(req_length);
+                        if (ReadExact(client_socket, req_buf.data(), req_length)) {
+                            dfvr::ActionRequest action;
+                            if (action.ParseFromArray(req_buf.data(), req_length)) {
+                                std::lock_guard<std::mutex> lock(actions_mutex);
+                                pending_actions.push_back(action);
+                            }
+                        } else break;
+                    }
+                } else {
+                    break; // Client disconnected
+                }
+            } else if (result < 0) {
+                break; // Socket error
             }
 
-            uint32_t payload_length = static_cast<uint32_t>(payload_data.size());
-            if (!WriteExact(client_socket, reinterpret_cast<const char*>(&payload_length), sizeof(payload_length))) break;
-            if (!WriteExact(client_socket, payload_data.data(), payload_length)) break;
+            // Check if game state has updated
+            std::string payload_data;
+            bool send_payload = false;
+            {
+                std::unique_lock<std::mutex> lock(state_mutex);
+                if (state_cv.wait_for(lock, std::chrono::milliseconds(10), []{ return state_updated || !is_running; })) {
+                    if (!is_running) break;
+                    shared_game_state.SerializeToString(&payload_data);
+                    state_updated = false;
+                    send_payload = true;
+                }
+            }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 20 Hz
+            if (send_payload) {
+                uint32_t payload_length = static_cast<uint32_t>(payload_data.size());
+                if (!WriteExact(client_socket, reinterpret_cast<const char*>(&payload_length), sizeof(payload_length))) break;
+                if (!WriteExact(client_socket, payload_data.data(), payload_length)) break;
+            }
         }
     }
     
     std::cout << "Client disconnected." << std::endl;
     closesocket(client_socket);
+}
+
+int GetConfigPort() {
+    int port = 9000;
+    std::ifstream file("dfhack-config/dfvr_bridge.ini");
+    if (file.is_open()) {
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.find("port=") == 0) {
+                try {
+                    port = std::stoi(line.substr(5));
+                } catch (...) {}
+            }
+        }
+    }
+    return port;
 }
 
 // Background thread function serving clients
@@ -229,7 +341,7 @@ void ServerLoop() {
     sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(9000);
+    server_addr.sin_port = htons(GetConfigPort());
 
     if (bind(server_socket, (sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
         closesocket(server_socket);
@@ -269,7 +381,8 @@ void ServerLoop() {
 DFhackCExport command_result plugin_init(color_ostream &out, std::vector<PluginCommand> &commands) {
     is_running = true;
     server_thread = std::thread(ServerLoop);
-    out.print("DFVR Bridge Server started on port 9000.\n");
+    int port = GetConfigPort();
+    out.print("DFVR Bridge Server started on port %d.\n", port);
     return CR_OK;
 }
 
