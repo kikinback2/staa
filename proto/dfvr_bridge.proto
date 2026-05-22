@@ -38,13 +38,20 @@ message MapBlock {
   repeated int32 tiles = 2; // Flattened 16x16 grid of tile types
 }
 
+enum PayloadType {
+  FULL_STATE = 0;
+  DYNAMIC_ONLY = 1;
+  MAP_ONLY = 2;
+}
+
 // Full state payload sent from DFHack to Godot
 message GameStatePayload {
-  uint64 frame_tick = 1;
-  repeated EntityData entities = 2;
-  repeated MenuOption current_menu_options = 3;
-  repeated MapBlock map_blocks = 4;
-  string latest_log_text = 5;    // DF generated text to be rewritten by LLM
+  PayloadType type = 1;
+  uint64 frame_tick = 2;
+  repeated EntityData entities = 3;
+  repeated MenuOption current_menu_options = 4;
+  repeated MapBlock map_blocks = 5;
+  string latest_log_text = 6;    // DF generated text to be rewritten by LLM
 }
 
 // Request sent from Godot to DFHack

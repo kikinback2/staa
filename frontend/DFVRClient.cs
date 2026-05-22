@@ -176,15 +176,58 @@ public partial class DFVRClient : Node
 
     private void ProcessPayload(GameStatePayload payload)
     {
-        foreach (var entity in payload.Entities)
+        if (payload.Type == PayloadType.FullState || payload.Type == PayloadType.DynamicOnly)
         {
-            UpdateEntityInGodot(entity);
+            foreach (var entity in payload.Entities)
+            {
+                UpdateEntityInGodot(entity);
+            }
         }
         
-        foreach (var block in payload.MapBlocks)
+        if (payload.Type == PayloadType.FullState || payload.Type == PayloadType.MapOnly)
         {
-            UpdateMapBlockInGodot(block);
+            foreach (var block in payload.MapBlocks)
+            {
+                UpdateMapBlockInGodot(block);
+            }
         }
+    }
+
+    // ==========================================
+    // STT / TTS / LLM Placeholders
+    // ==========================================
+    
+    // Placeholder for Speech-To-Text processing
+    public async Task<string> ProcessSpeechToTextAsync(byte[] audioData)
+    {
+        // TODO: Plug in local Whisper.net model or OpenAI Whisper API
+        GD.Print("STT: Processing audio...");
+        await Task.Delay(500); // Simulate processing time
+        return "Can we trade?"; 
+    }
+
+    // Placeholder for Text-To-Speech output
+    public void PlayTextToSpeech(string text)
+    {
+        // TODO: Plug in Godot's DisplayServer.TtsSpeak, Bark, or System.Speech
+        GD.Print($"TTS output: {text}");
+        if (DisplayServer.TtsIsSpeaking()) DisplayServer.TtsStop();
+        DisplayServer.TtsSpeak(text, "", 50, 1.0f, 1.0f);
+    }
+
+    // Placeholder for LLM intent generation
+    public async Task GenerateIntentFromLLMAsync(string spokenText, RepeatedField<MenuOption> currentOptions)
+    {
+        // TODO: Plug in Ollama, LM Studio, or OpenAI API
+        GD.Print($"LLM: Finding intent for '{spokenText}'");
+        await Task.Delay(1000); // Simulate LLM inference
+        
+        // Mock selection logic:
+        int selectedOptionId = 1; 
+        if (currentOptions.Count > 0) selectedOptionId = currentOptions[0].OptionId;
+        
+        GD.Print($"LLM chose option ID: {selectedOptionId}");
+        SendAction(selectedOptionId);
     }
 
     private void UpdateEntityInGodot(EntityData entity)
@@ -224,7 +267,12 @@ public partial class DFVRClient : Node
             var shape = new CapsuleShape3D();
             collisionShape.Shape = shape;
             
+            var meshInstance = new MeshInstance3D();
+            var mesh = new CapsuleMesh();
+            meshInstance.Mesh = mesh;
+            
             partNode.AddChild(collisionShape);
+            partNode.AddChild(meshInstance);
             parent.AddChild(partNode);
             
             partNode.SetMeta("body_part_id", part.Id);
@@ -235,6 +283,10 @@ public partial class DFVRClient : Node
         var capShape = (CapsuleShape3D)((CollisionShape3D)partNode.GetChild(0)).Shape;
         capShape.Radius = scale * 0.25f;
         capShape.Height = scale * 1.0f;
+
+        var capMesh = (CapsuleMesh)((MeshInstance3D)partNode.GetChild(1)).Mesh;
+        capMesh.Radius = scale * 0.25f;
+        capMesh.Height = scale * 1.0f;
         
         partNode.Position = new Vector3(part.RelativePosition.X, part.RelativePosition.Y, part.RelativePosition.Z);
     }
@@ -260,6 +312,15 @@ public partial class DFVRClient : Node
 
         blockNode.Position = new Vector3(block.Position.X, block.Position.Y, block.Position.Z);
         
+        // Clone tile array so background thread can process it safely
+        int[] tileData = new int[block.Tiles.Count];
+        block.Tiles.CopyTo(tileData, 0);
+
+        _ = Task.Run(() => GenerateMeshForBlockAsync(blockNode, tileData));
+    }
+
+    private void GenerateMeshForBlockAsync(StaticBody3D blockNode, int[] tiles)
+    {
         var surfaceTool = new SurfaceTool();
         surfaceTool.Begin(Mesh.PrimitiveType.Triangles);
         
@@ -271,11 +332,11 @@ public partial class DFVRClient : Node
             {
                 if (visited[x, z]) continue;
                 
-                int tileType = block.Tiles[z * 16 + x];
+                int tileType = tiles[z * 16 + x];
                 if (tileType <= 0) continue;
                 
                 int endX = x;
-                while (endX + 1 < 16 && !visited[endX + 1, z] && block.Tiles[z * 16 + (endX + 1)] == tileType)
+                while (endX + 1 < 16 && !visited[endX + 1, z] && tiles[z * 16 + (endX + 1)] == tileType)
                 {
                     endX++;
                 }
@@ -286,7 +347,7 @@ public partial class DFVRClient : Node
                 {
                     for (int ix = x; ix <= endX; ix++)
                     {
-                        if (visited[ix, endZ + 1] || block.Tiles[(endZ + 1) * 16 + ix] != tileType)
+                        if (visited[ix, endZ + 1] || tiles[(endZ + 1) * 16 + ix] != tileType)
                         {
                             canExpandZ = false;
                             break;
@@ -312,15 +373,23 @@ public partial class DFVRClient : Node
         
         if (arrayMesh != null)
         {
-            var meshInstance = new MeshInstance3D();
-            meshInstance.Mesh = arrayMesh;
-            blockNode.AddChild(meshInstance);
-            
-            var collisionShape = new CollisionShape3D();
-            var concaveShape = arrayMesh.CreateTrimeshShape();
-            collisionShape.Shape = concaveShape;
-            blockNode.AddChild(collisionShape);
+            // Safely update the Godot scene tree on the main thread
+            CallDeferred(nameof(ApplyMeshToBlock), blockNode, arrayMesh);
         }
+    }
+
+    private void ApplyMeshToBlock(StaticBody3D blockNode, ArrayMesh arrayMesh)
+    {
+        if (!IsInstanceValid(blockNode)) return;
+
+        var meshInstance = new MeshInstance3D();
+        meshInstance.Mesh = arrayMesh;
+        blockNode.AddChild(meshInstance);
+        
+        var collisionShape = new CollisionShape3D();
+        var concaveShape = arrayMesh.CreateTrimeshShape();
+        collisionShape.Shape = concaveShape;
+        blockNode.AddChild(collisionShape);
     }
     
     private void AddCubeToSurfaceTool(SurfaceTool st, Vector3 min, Vector3 max)

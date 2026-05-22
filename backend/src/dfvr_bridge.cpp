@@ -61,6 +61,14 @@ void ScrapeMenuOptions(dfvr::GameStatePayload& payload) {
     }
 }
 
+// Map Block Delta Tracking
+struct BlockCoord {
+    int x, y, z;
+    bool operator==(const BlockCoord& o) const { return x == o.x && y == o.y && z == o.z; }
+    bool operator!=(const BlockCoord& o) const { return !(*this == o); }
+};
+static BlockCoord last_player_block = {-999, -999, -999};
+
 // Scrapes units and their body parts
 void ScrapeEntities(dfvr::GameStatePayload& payload) {
     for (auto unit : world->units.active) {
@@ -91,9 +99,25 @@ void ScrapeEntities(dfvr::GameStatePayload& payload) {
                 part->set_id(i);
                 part->set_name(part_raw->name_singular[0]->value);
                 
-                // Mock relative position for now (Skeletal data isn't in DF)
-                // In Godot, we'll arrange these into a humanoid or creature rig.
-                part->mutable_relative_position()->set_y(0.0f); 
+                // Heuristic mapping for relative position based on standard humanoid names
+                float y_offset = 0.0f;
+                float x_offset = 0.0f;
+                std::string part_name = part_raw->name_singular[0]->value;
+                if (part_name.find("head") != std::string::npos || part_name.find("skull") != std::string::npos) {
+                    y_offset = 0.6f;
+                } else if (part_name.find("foot") != std::string::npos || part_name.find("toe") != std::string::npos) {
+                    y_offset = -0.8f;
+                } else if (part_name.find("leg") != std::string::npos) {
+                    y_offset = -0.4f;
+                    x_offset = (part_name.find("right") != std::string::npos) ? 0.2f : -0.2f;
+                } else if (part_name.find("arm") != std::string::npos || part_name.find("hand") != std::string::npos) {
+                    y_offset = 0.3f;
+                    x_offset = (part_name.find("right") != std::string::npos) ? 0.4f : -0.4f;
+                }
+
+                part->mutable_relative_position()->set_x(x_offset);
+                part->mutable_relative_position()->set_y(y_offset); 
+                part->mutable_relative_position()->set_z(0.0f);
                 
                 // Use relsize for collider scaling
                 part->set_size_volume(static_cast<float>(part_raw->relsize));
@@ -103,34 +127,49 @@ void ScrapeEntities(dfvr::GameStatePayload& payload) {
 }
 
 // Scrapes map tiles around the player
-void ScrapeMapBlocks(dfvr::GameStatePayload& payload) {
+// Scrapes map tiles around the player in a 3x3 block grid
+bool ScrapeMapBlocks(dfvr::GameStatePayload& payload, bool force_update) {
     df::unit* player = world->units.active.size() > 0 ? world->units.active[0] : nullptr;
-    if (!player) return;
+    if (!player) return false;
 
     int player_x = player->pos.x;
     int player_y = player->pos.y;
     int player_z = player->pos.z;
 
-    // Send the current 16x16 block the player is in
     int bx = (player_x / 16) * 16;
     int by = (player_y / 16) * 16;
 
-    auto block = payload.add_map_blocks();
-    block->mutable_position()->set_x((float)bx);
-    block->mutable_position()->set_y((float)player_z);
-    block->mutable_position()->set_z((float)by);
+    BlockCoord current_block = {bx, by, player_z};
+    if (!force_update && current_block == last_player_block) {
+        return false; // Map hasn't changed block boundaries
+    }
+    last_player_block = current_block;
 
-    for (int ty = 0; ty < 16; ++ty) {
-        for (int tx = 0; tx < 16; ++tx) {
-            df::coord pos(bx + tx, by + ty, player_z);
-            if (Maps::isValidTilePos(pos)) {
-                auto tile_type = Maps::getTileType(pos);
-                block->add_tiles(static_cast<int32_t>(tile_type));
-            } else {
-                block->add_tiles(0); // Void
+    // Send a 3x3 grid of blocks
+    for (int obx = -1; obx <= 1; ++obx) {
+        for (int oby = -1; oby <= 1; ++oby) {
+            int target_bx = bx + (obx * 16);
+            int target_by = by + (oby * 16);
+
+            auto block = payload.add_map_blocks();
+            block->mutable_position()->set_x((float)target_bx);
+            block->mutable_position()->set_y((float)player_z);
+            block->mutable_position()->set_z((float)target_by);
+
+            for (int ty = 0; ty < 16; ++ty) {
+                for (int tx = 0; tx < 16; ++tx) {
+                    df::coord pos(target_bx + tx, target_by + ty, player_z);
+                    if (Maps::isValidTilePos(pos)) {
+                        auto tile_type = Maps::getTileType(pos);
+                        block->add_tiles(static_cast<int32_t>(tile_type));
+                    } else {
+                        block->add_tiles(0); // Void
+                    }
+                }
             }
         }
     }
+    return true;
 }
 
 // DFHack Update Hook (Main Thread)
@@ -154,13 +193,22 @@ DFhackCExport command_result plugin_onupdate(color_ostream &out) {
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         
-        // Clear and re-populate the shared state
-        shared_game_state.Clear();
-        shared_game_state.set_frame_tick(world->frame_counter);
-        
-        ScrapeMenuOptions(shared_game_state);
-        ScrapeEntities(shared_game_state);
-        ScrapeMapBlocks(shared_game_state);
+        // Populate Map State
+        dfvr::GameStatePayload map_payload;
+        bool map_updated = ScrapeMapBlocks(map_payload, false);
+        if (map_updated) {
+            map_payload.set_type(dfvr::PayloadType::MAP_ONLY);
+            map_payload.set_frame_tick(world->frame_counter);
+            shared_game_state.CopyFrom(map_payload); // Simplified for now, in a robust system we'd queue multiple payloads
+        } else {
+            // Populate Dynamic State
+            shared_game_state.Clear();
+            shared_game_state.set_type(dfvr::PayloadType::DYNAMIC_ONLY);
+            shared_game_state.set_frame_tick(world->frame_counter);
+            
+            ScrapeMenuOptions(shared_game_state);
+            ScrapeEntities(shared_game_state);
+        }
         
         state_updated = true;
     }
