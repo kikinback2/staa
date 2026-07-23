@@ -1,0 +1,25 @@
+[application]
+
+config/name="Slaves to Armok: VR (Meta Quest 3)"
+run/main_scene="res://scenes/Main.tscn"
+config/features=PackedStringArray("4.3", "C#", "Mobile")
+config/icon="res://icon.svg"
+
+[dotnet]
+
+project/assembly_name="DFVRClient"
+
+[xr]
+
+openxr/enabled=true
+shaders/enabled=true
+
+[rendering]
+
+renderer/rendering_method="mobile"
+textures/vram_compression/import_etc2_astc=true
+
+[android]
+
+export/architectures=PackedStringArray("arm64-v8a")
+permissions/custom_permissions=PackedStringArray("android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE", "android.permission.CHANGE_WIFI_MULTICAST_STATE")

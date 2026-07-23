@@ -1,0 +1,17 @@
+[gd_scene load_steps=3 format=3 uid="uid://main_scene"]
+
+[ext_resource type="PackedScene" uid="uid://player_rig_scn" path="res://scenes/PlayerRig.tscn" id="1_rig"]
+[ext_resource type="PackedScene" uid="uid://network_ui_scn" path="res://scenes/NetworkUI.tscn" id="2_netui"]
+
+[node name="Main" type="Node3D"]
+
+[node name="PlayerRig" parent="." instance=ExtResource("1_rig")]
+
+[node name="NetworkUI" parent="." instance=ExtResource("2_netui")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.8, -2)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866025, -0.433013, 0.25, 0, 0.5, 0.866025, -0.5, -0.75, 0.433013, 0, 10, 0)
+shadow_enabled = true
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]

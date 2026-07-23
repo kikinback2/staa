@@ -1,5 +1,6 @@
 using Godot;
 using System;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,9 +13,14 @@ public partial class DFVRClient : Node
     private TcpClient _client;
     private NetworkStream _stream;
     private bool _isRunning = false;
+    private bool _isConnected = false;
 
     [Export] public string ServerIp = "127.0.0.1";
     [Export] public int ServerPort = 9000;
+    [Export] public int UdpDiscoveryPort = 9001;
+
+    private UdpClient _udpClient;
+    private bool _listeningForUdp = true;
 
     private GameStatePayload _latestPayload;
     private readonly object _payloadLock = new object();
@@ -24,7 +30,67 @@ public partial class DFVRClient : Node
 
     public override void _Ready()
     {
+        // Start UDP broadcast listener for zero-config connection
+        _ = Task.Run(UdpDiscoveryListenerAsync);
+
+        // Attempt initial connection to configured ServerIp
         _ = ConnectAndHandshakeAsync(ServerIp, ServerPort);
+    }
+
+    private async Task UdpDiscoveryListenerAsync()
+    {
+        try
+        {
+            _udpClient = new UdpClient(UdpDiscoveryPort);
+            _udpClient.EnableBroadcast = true;
+            IPEndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, UdpDiscoveryPort);
+
+            GD.Print($"Listening for UDP host discovery on port {UdpDiscoveryPort}...");
+
+            while (_listeningForUdp)
+            {
+                var result = await _udpClient.ReceiveAsync();
+                string message = System.Text.Encoding.UTF8.GetString(result.Buffer);
+                
+                if (message.StartsWith("DFVR_HOST:"))
+                {
+                    string hostIp = result.RemoteEndPoint.Address.ToString();
+                    GD.Print($"Discovered DFVR Host via UDP at IP: {hostIp}");
+                    
+                    if (!_isConnected)
+                    {
+                        ServerIp = hostIp;
+                        CallDeferred(nameof(ConnectToDiscoveredHost), hostIp, ServerPort);
+                        break; // Stop listening once connected
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            GD.PrintErr($"UDP Discovery error: {e.Message}");
+        }
+    }
+
+    private void ConnectToDiscoveredHost(string ip, int port)
+    {
+        if (!_isConnected)
+        {
+            var networkUi = GetNodeOrNull<Node3D>("/root/Main/NetworkUI");
+            if (networkUi != null)
+            {
+                // Update network UI status if method exists
+                networkUi.Call("UpdateStatus", $"Discovered Host at {ip}! Connecting...");
+            }
+            _ = ConnectAndHandshakeAsync(ip, port);
+        }
+    }
+
+    public void ConnectToHost(string ip, int port)
+    {
+        ServerIp = ip;
+        ServerPort = port;
+        _ = ConnectAndHandshakeAsync(ip, port);
     }
 
     public void SendAction(int optionId)
@@ -43,17 +109,19 @@ public partial class DFVRClient : Node
 
     private async Task ConnectAndHandshakeAsync(string ip, int port)
     {
+        if (_isConnected) return;
+
         try
         {
             _client = new TcpClient();
             await _client.ConnectAsync(ip, port);
             _stream = _client.GetStream();
             
-            GD.Print("Connected to server, initiating handshake...");
+            GD.Print($"Connected to server at {ip}:{port}, initiating handshake...");
 
             var request = new HandshakeRequest
             {
-                ClientVersion = "Godot VR Client 0.1a",
+                ClientVersion = "Meta Quest 3 VR Client 1.0",
                 Status = "Ready"
             };
 
@@ -81,12 +149,25 @@ public partial class DFVRClient : Node
             var response = HandshakeResponse.Parser.ParseFrom(responseBytes);
             GD.Print($"Handshake Successful! Server Version: {response.ServerVersion}, Time: {response.WorldTime}");
 
+            _isConnected = true;
             _isRunning = true;
+
+            var networkUi = GetNodeOrNull<Node3D>("/root/Main/NetworkUI");
+            if (networkUi != null)
+            {
+                networkUi.Call("UpdateStatus", $"Connected to {ip}:{port} (v{response.ServerVersion})");
+            }
+
             _ = Task.Run(NetworkLoopAsync);
         }
         catch (Exception e)
         {
             GD.PrintErr($"Handshake failed: {e.Message}");
+            var networkUi = GetNodeOrNull<Node3D>("/root/Main/NetworkUI");
+            if (networkUi != null)
+            {
+                networkUi.Call("UpdateStatus", $"Connection Failed: {e.Message}");
+            }
         }
     }
 
@@ -151,6 +232,7 @@ public partial class DFVRClient : Node
             {
                 GD.PrintErr($"Network Error: {e.Message}");
                 _isRunning = false;
+                _isConnected = false;
             }
         }
     }
@@ -191,43 +273,6 @@ public partial class DFVRClient : Node
                 UpdateMapBlockInGodot(block);
             }
         }
-    }
-
-    // ==========================================
-    // STT / TTS / LLM Placeholders
-    // ==========================================
-    
-    // Placeholder for Speech-To-Text processing
-    public async Task<string> ProcessSpeechToTextAsync(byte[] audioData)
-    {
-        // TODO: Plug in local Whisper.net model or OpenAI Whisper API
-        GD.Print("STT: Processing audio...");
-        await Task.Delay(500); // Simulate processing time
-        return "Can we trade?"; 
-    }
-
-    // Placeholder for Text-To-Speech output
-    public void PlayTextToSpeech(string text)
-    {
-        // TODO: Plug in Godot's DisplayServer.TtsSpeak, Bark, or System.Speech
-        GD.Print($"TTS output: {text}");
-        if (DisplayServer.TtsIsSpeaking()) DisplayServer.TtsStop();
-        DisplayServer.TtsSpeak(text, "", 50, 1.0f, 1.0f);
-    }
-
-    // Placeholder for LLM intent generation
-    public async Task GenerateIntentFromLLMAsync(string spokenText, RepeatedField<MenuOption> currentOptions)
-    {
-        // TODO: Plug in Ollama, LM Studio, or OpenAI API
-        GD.Print($"LLM: Finding intent for '{spokenText}'");
-        await Task.Delay(1000); // Simulate LLM inference
-        
-        // Mock selection logic:
-        int selectedOptionId = 1; 
-        if (currentOptions.Count > 0) selectedOptionId = currentOptions[0].OptionId;
-        
-        GD.Print($"LLM chose option ID: {selectedOptionId}");
-        SendAction(selectedOptionId);
     }
 
     private void UpdateEntityInGodot(EntityData entity)
@@ -312,7 +357,6 @@ public partial class DFVRClient : Node
 
         blockNode.Position = new Vector3(block.Position.X, block.Position.Y, block.Position.Z);
         
-        // Clone tile array so background thread can process it safely
         int[] tileData = new int[block.Tiles.Count];
         block.Tiles.CopyTo(tileData, 0);
 
@@ -373,7 +417,6 @@ public partial class DFVRClient : Node
         
         if (arrayMesh != null)
         {
-            // Safely update the Godot scene tree on the main thread
             CallDeferred(nameof(ApplyMeshToBlock), blockNode, arrayMesh);
         }
     }
@@ -394,32 +437,26 @@ public partial class DFVRClient : Node
     
     private void AddCubeToSurfaceTool(SurfaceTool st, Vector3 min, Vector3 max)
     {
-        // Top
         st.SetNormal(new Vector3(0, 1, 0));
         st.AddVertex(new Vector3(min.X, max.Y, min.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z));
         st.AddVertex(new Vector3(min.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z));
         
-        // Bottom
         st.SetNormal(new Vector3(0, -1, 0));
         st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z)); st.AddVertex(new Vector3(min.X, min.Y, max.Z));
         st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z));
         
-        // Front
         st.SetNormal(new Vector3(0, 0, 1));
         st.AddVertex(new Vector3(min.X, min.Y, max.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z));
         st.AddVertex(new Vector3(min.X, min.Y, max.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z));
         
-        // Back
         st.SetNormal(new Vector3(0, 0, -1));
         st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(min.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z));
         st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, min.Y, min.Z));
         
-        // Left
         st.SetNormal(new Vector3(-1, 0, 0));
         st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(min.X, min.Y, max.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z));
         st.AddVertex(new Vector3(min.X, min.Y, min.Z)); st.AddVertex(new Vector3(min.X, max.Y, max.Z)); st.AddVertex(new Vector3(min.X, max.Y, min.Z));
         
-        // Right
         st.SetNormal(new Vector3(1, 0, 0));
         st.AddVertex(new Vector3(max.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z)); st.AddVertex(new Vector3(max.X, min.Y, max.Z));
         st.AddVertex(new Vector3(max.X, min.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, min.Z)); st.AddVertex(new Vector3(max.X, max.Y, max.Z));
@@ -428,6 +465,8 @@ public partial class DFVRClient : Node
     public override void _ExitTree()
     {
         _isRunning = false;
+        _listeningForUdp = false;
+        _udpClient?.Close();
         _stream?.Close();
         _client?.Close();
     }

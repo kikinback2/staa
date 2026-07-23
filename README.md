@@ -59,16 +59,42 @@ By replacing clunky spreadsheet menus with deterministic spatial physics and a l
 - [x] Establish two-way handshake with Godot 4.
 
 ### Milestone 2: Spatial Physics
-- [ ] Implement greedy meshing for DF map blocks in Godot.
-- [ ] Map primitive 3D capsules/hitboxes to parsed DF entity anatomy.
-- [ ] Translate Godot physics collisions into DFHack combat menu injections.
+- [x] Implement greedy meshing for DF map blocks in Godot.
+- [x] Map primitive 3D capsules/hitboxes to parsed DF entity anatomy.
+- [x] Translate Godot physics collisions into DFHack combat menu injections.
 
-### Milestone 3: The Translation Layer
+### Milestone 3: The Translation Layer & Meta Quest 3 Playable Demo
+- [x] UDP LAN auto-discovery service (Port 9001) for zero-config Meta Quest 3 connectivity.
+- [x] Standalone C++ Mock Server mode (`dfvr_bridge_mock`) for rapid testing without launching Dwarf Fortress.
+- [x] VR Player Rig, Network Fallback Keypad UI, and physical weapon collision hitboxing.
 - [ ] Integrate local Whisper STT pipeline.
 - [ ] Prompt engineer the local LLM to classify transcriptions into DF conversation integers.
 - [ ] Route LLM-rewritten DF game logs to the TTS audio output.
 
 ---
 
-## Contributing
-*Details on setting up the local build environment, installing DFHack headers, and compiling the Godot C# project will be added as Milestone 1 progresses.*
+## Building & Deploying the Meta Quest 3 Demo
+
+### 1. Building the Backend / Mock Server
+```cd backend
+mkdir build && cd build
+cmake ..
+make
+```
+To run the standalone mock server (without launching Dwarf Fortress):
+```bash
+./dfvr_bridge_mock
+```
+
+### 2. Building and Deploying to Meta Quest 3
+1. Open the project in **Godot 4.x (.NET/C#)**:
+   ```bash
+   godot frontend/project.godot
+   ```
+2. Export the Android APK for Meta Quest 3 (Mobile Vulkan / OpenXR Meta plugin enabled, with permissions `INTERNET`, `ACCESS_NETWORK_STATE`, `CHANGE_WIFI_MULTICAST_STATE`).
+3. Install the APK via ADB to your Meta Quest 3:
+   ```bash
+   adb install -r bin/staa_quest3.apk
+   ```
+4. Put on your Quest 3. The app will automatically discover the PC host IP via UDP broadcast (port 9001) or allow manual IP entry via the in-VR numeric keypad.
+5. Physically swing your weapon against enemy body part hitboxes to trigger combat action injections.

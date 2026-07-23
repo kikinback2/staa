@@ -1,0 +1,19 @@
+[gd_scene load_steps=3 format=3 uid="uid://player_rig_scn"]
+
+[ext_resource type="Script" path="res://scripts/PlayerRig.cs" id="1_rig"]
+[ext_resource type="PackedScene" uid="uid://vr_weapon_scn" path="res://scenes/VRWeapon.tscn" id="2_weapon"]
+
+[node name="PlayerRig" type="XROrigin3D"]
+script = ExtResource("1_rig")
+
+[node name="XRCamera3D" type="XRCamera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.7, 0)
+
+[node name="LeftController" type="XRController3D" parent="."]
+tracker = &"left_hand"
+
+[node name="RightController" type="XRController3D" parent="."]
+tracker = &"right_hand"
+
+[node name="VRWeapon" parent="RightController" instance=ExtResource("2_weapon")]
+transform = Transform3D(1, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, -0.1)
